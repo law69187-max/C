@@ -9,6 +9,7 @@ const Settings = require('../models/settings.model.js');
 const { askDeepSeek } = require('../services/deepseekAndroid.service.js');
 
 const DEEPSEEK_CHAPTERS_PER_CONVERSATION = 100;
+const DEEPSEEK_MAX_ATTEMPTS_PER_TOKEN = 5;
 const DEFAULT_DEEPSEEK_POW_PROVIDERS = [
     { id: 'railway', name: 'Railway', url: 'https://web-production-c09dc.up.railway.app/pow' },
     { id: 'ngrok', name: 'Ngrok', url: 'https://immunize-quintet-trimmer.ngrok-free.dev/get_pow' }
@@ -30,21 +31,41 @@ function resolveDeepSeekPowUrl(provider) {
     return normalizePowProviderUrl(selected?.url);
 }
 
-function getDeepSeekConversationContext(contextStore, purpose, batchKey) {
+function getDeepSeekConversationContext(contextStore, purpose, batchKey, scopeKey = 'default') {
     if (!contextStore || !purpose || batchKey === undefined || batchKey === null) return undefined;
     if (!contextStore[purpose]) contextStore[purpose] = new Map();
     const scopedStore = contextStore[purpose];
-    if (!scopedStore.has(batchKey)) {
-        scopedStore.set(batchKey, {
+    const contextKey = `${scopeKey}:${batchKey}`;
+    if (!scopedStore.has(contextKey)) {
+        scopedStore.set(contextKey, {
             purpose,
             batchKey,
+            scopeKey,
             sessionId: null,
             parentMessageId: null,
             requestMessageId: null,
             lastUpdated: null
         });
     }
-    return scopedStore.get(batchKey);
+    return scopedStore.get(contextKey);
+}
+
+function resetConversationContextsForScope(contextStore, scopeKey, batchKey) {
+    if (!contextStore || !scopeKey) return;
+    for (const scopedStore of Object.values(contextStore)) {
+        if (!(scopedStore instanceof Map)) continue;
+        for (const [contextKey, context] of scopedStore.entries()) {
+            if (context?.scopeKey !== scopeKey) continue;
+            if (batchKey !== undefined && batchKey !== null && context.batchKey !== batchKey) continue;
+            scopedStore.delete(contextKey);
+        }
+    }
+}
+
+function getTokenConversationScope(provider, key, keyIdx) {
+    const providerKey = provider.providerId || provider.name || 'provider';
+    const tokenHash = hashStringToIndex(key || `key-${keyIdx}`, 1000000007);
+    return `${providerKey}:token-${keyIdx}:${tokenHash}`;
 }
 
 function hashStringToIndex(value, size) {
@@ -421,7 +442,8 @@ async function callTranslationProvider(provider, modelName, apiKey, prompt, opti
             context: getDeepSeekConversationContext(
                 options.conversationContexts,
                 options.conversationPurpose,
-                options.conversationBatchKey
+                options.conversationBatchKey,
+                options.conversationScopeKey
             )
         };
         return askDeepSeek(prompt, deepSeekOptions);
@@ -503,13 +525,13 @@ async function callTranslationProvider(provider, modelName, apiKey, prompt, opti
             'chatgpt-residency-region': "no_constraint",
             'Cookie': "__cflb=04dTod5Jcx9DYJeMeKbyj32ve2B3i9pLVRxJxEAaKD; _cfuvid=PXu6q36jhfgxnsdFkDmqwLzCfHOSgG588liApL0856A-1777834828.2542033-1.0.1.1-JFC10kaoqt9_IXzxrixI6zZuAm.TzRPF14QfJiD43MQ; oai-ll=; oai-sc=0gAAAAABp959mEmk6Qr5JsnqYMpWx1-15EJhCVV2EV6SQpet7Z7SjNuAT0x2cVScJu_g_TE9_NXidYfi68DtZfl4ImOQIRkr8PF-R-v9PUl7IPGtYiF1rwqdVm0NjapKV1lROdrmNGkiuNgcVMGYXMrP45hfmmQKiCQ5MBQLjfI7XI2tKSLvHT3WkjFEnmDZIRtVz85lyV9pxK181GJRARSxM53m06IfD3jEDjVbSR5QDQbL6Nxl4l7c; __cf_bm=y_lpbPz3viZYHSAd8nCLtIlm2JBCYWvEwOz8xvvwFow-1777835878.3854406-1.0.1.1-Muu0UxZKqufJhSVDELNGz2fO12Xcqc.oJ3hINoXkGIc2tGinJqVnmBTM7EAKDRfqdl1WdKtZ06fuCJ3y5DddxeMPVlBNX_r7daQReYa59qkFBwXOF3p4W3lwU.tdPN9A",
             'Conduit-Token': conduitToken,
-            'x-oai-convo-session-id': getDeepSeekConversationContext(options.conversationContexts, options.conversationPurpose, options.conversationBatchKey)?.sessionId || uuidv4(),
+            'x-oai-convo-session-id': getDeepSeekConversationContext(options.conversationContexts, options.conversationPurpose, options.conversationBatchKey, options.conversationScopeKey)?.sessionId || uuidv4(),
             'x-oai-turn-trace-id': uuidv4(),
             'x-openai-target-path': '/backend-api/f/conversation'
         };
         
         const messageId = uuidv4();
-        const chatContext = getDeepSeekConversationContext(options.conversationContexts, options.conversationPurpose, options.conversationBatchKey);
+        const chatContext = getDeepSeekConversationContext(options.conversationContexts, options.conversationPurpose, options.conversationBatchKey, options.conversationScopeKey);
         if (chatContext && !chatContext.sessionId) chatContext.sessionId = chatHeaders['x-oai-convo-session-id'];
         const parentMessageId = chatContext?.parentMessageId || uuidv4();
         
@@ -785,14 +807,21 @@ ${sourceContent}
 
                     for (let keyIdx = 0; keyIdx < keys.length; keyIdx++) {
                         const key = keys[keyIdx];
-                        try {
-                            await pushLog(jobId, `1️⃣ مزوّد: ${providerName} | نموذج: ${modelToUse} | مفتاح ${keyIdx + 1}/${keys.length} | محاولة ${attempt}`, 'info');
-                            const candidateText = await callTranslationProvider(provider, modelToUse, key, promptForAttempt, {
-                                deepSeekJobId: jobId.toString(),
-                                conversationContexts,
-                                conversationPurpose: 'chapters',
-                                conversationBatchKey
-                            });
+                        const conversationScopeKey = isDeepSeek ? getTokenConversationScope(provider, key, keyIdx) : undefined;
+                        const tokenAttempts = isDeepSeek ? DEEPSEEK_MAX_ATTEMPTS_PER_TOKEN : 1;
+                        let tokenFailed = false;
+
+                        for (let tokenAttempt = 1; tokenAttempt <= tokenAttempts; tokenAttempt++) {
+                            try {
+                                const retryLabel = isDeepSeek ? ` | محاولة التوكن ${tokenAttempt}/${tokenAttempts}` : '';
+                                await pushLog(jobId, `1️⃣ مزوّد: ${providerName} | نموذج: ${modelToUse} | مفتاح ${keyIdx + 1}/${keys.length} | محاولة ${attempt}${retryLabel}`, 'info');
+                                const candidateText = await callTranslationProvider(provider, modelToUse, key, promptForAttempt, {
+                                    deepSeekJobId: jobId.toString(),
+                                    conversationContexts,
+                                    conversationPurpose: 'chapters',
+                                    conversationBatchKey,
+                                    conversationScopeKey
+                                });
                             let candidateTextForReview = removeDeepSeekFinishedMarker(candidateText);
                             if (candidateTextForReview !== (candidateText || '').trim()) {
                                 await pushLog(jobId, `✂️ تم حذف علامة DeepSeek النهائية FINISHED من الفصل ${chapterNum} قبل المراجعة والحفظ`, 'info');
@@ -806,7 +835,8 @@ ${sourceContent}
                                         deepSeekJobId: jobId.toString(),
                                         conversationContexts,
                                         conversationPurpose: 'chapter_review',
-                                        conversationBatchKey
+                                        conversationBatchKey,
+                                        conversationScopeKey
                                     });
                                     validation = validateTranslatedChapter(candidateTextForReview, sourceContent);
                                 } catch (replaceErr) {
@@ -819,13 +849,16 @@ ${sourceContent}
                                     deepSeekJobId: jobId.toString(),
                                     conversationContexts,
                                     conversationPurpose: 'chapter_review',
-                                    conversationBatchKey
+                                    conversationBatchKey,
+                                    conversationScopeKey
                                 });
 
                                 if (review.decision !== 'accept') {
                                     translatedText = candidateTextForReview || '';
                                     lastValidationReasons = [...validation.reasons, review.reason];
                                     await pushLog(jobId, `🧪 فشلت مراجعة الفصل ${chapterNum}: ${lastValidationReasons.join('، ')} — ستتم إعادة الترجمة ولن ننتقل للفصل التالي`, 'warning');
+                                    if (isDeepSeek) resetConversationContextsForScope(conversationContexts, conversationScopeKey, conversationBatchKey);
+                                    tokenFailed = true;
                                     continue;
                                 }
 
@@ -836,12 +869,26 @@ ${sourceContent}
                             lastValidationReasons = [];
                             translationSuccess = true;
                             usedProvider = provider;
-                            await pushLog(jobId, `✅ نجحت الترجمة والمراجعة باستخدام ${providerName}`, 'success');
-                            break;
-                        } catch (err) {
-                            console.error(`❌ فشل ${providerName} مفتاح ${keyIdx+1}: ${err.message}`);
-                            await pushLog(jobId, `❌ فشل: ${err.message}`, 'warning');
-                            if (keyIdx < keys.length - 1) await delay(3000);
+                                await pushLog(jobId, `✅ نجحت الترجمة والمراجعة باستخدام ${providerName}`, 'success');
+                                break;
+                            } catch (err) {
+                                tokenFailed = true;
+                                console.error(`❌ فشل ${providerName} مفتاح ${keyIdx+1}: ${err.message}`);
+                                await pushLog(jobId, `❌ فشل: ${err.message}`, 'warning');
+                                if (isDeepSeek && tokenAttempt < tokenAttempts) {
+                                    resetConversationContextsForScope(conversationContexts, conversationScopeKey, conversationBatchKey);
+                                    await pushLog(jobId, `🔁 DeepSeek: سيتم إنشاء محادثات جديدة لنفس التوكن قبل إعادة المحاولة ${tokenAttempt + 1}/${tokenAttempts}`, 'warning');
+                                    await delay(3000);
+                                }
+                            }
+                        }
+
+                        if (translationSuccess) break;
+                        if (isDeepSeek && tokenFailed && keyIdx < keys.length - 1) {
+                            await pushLog(jobId, `➡️ DeepSeek: فشل التوكن ${keyIdx + 1} بعد ${tokenAttempts} محاولات؛ الانتقال لتوكن آخر بمحادثاته المستقلة`, 'warning');
+                            await delay(3000);
+                        } else if (!isDeepSeek && keyIdx < keys.length - 1) {
+                            await delay(3000);
                         }
                     }
 
@@ -920,7 +967,8 @@ Arabic Text (Excerpt):
                             deepSeekJobId: jobId.toString(),
                             conversationContexts,
                             conversationPurpose: 'glossary',
-                            conversationBatchKey
+                            conversationBatchKey,
+                            conversationScopeKey: getTokenConversationScope(extProvider, extKey, 0)
                         });
                     }
                     
