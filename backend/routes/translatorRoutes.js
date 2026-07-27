@@ -218,6 +218,7 @@ function truncatePromptIfNeeded(prompt, maxLength = 10000) {
 const ARABIC_FULL_CHAPTER_WORD_THRESHOLD = 800;
 const SHORT_CHAPTER_SOURCE_WORD_THRESHOLD = 900;
 const MIN_ARABIC_TO_ENGLISH_WORD_RATIO = 0.35;
+const ALLOWED_SHORT_LATIN_TOKEN_PATTERN = /^[A-Z]{2,4}\d*$/;
 
 function stripCodeBlocks(text) {
     return (text || '').replace(/```[\s\S]*?```/g, ' ');
@@ -243,6 +244,12 @@ function escapeRegex(value) {
     return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function isAllowedShortLatinToken(word) {
+    const normalized = (word || '').trim();
+    if (normalized.length <= 1) return true;
+    return ALLOWED_SHORT_LATIN_TOKEN_PATTERN.test(normalized) && !/[AEIOU]/.test(normalized);
+}
+
 function extractEnglishResidues(text) {
     const cleaned = stripCodeBlocks(removeDeepSeekFinishedMarker(text));
     const matches = cleaned.match(/\b[A-Za-z][A-Za-z'’\-]*\b/g) || [];
@@ -252,8 +259,8 @@ function extractEnglishResidues(text) {
     for (const word of matches) {
         const normalized = word.trim();
         if (normalized.toUpperCase() === 'FINISHED') continue;
-        // السماح بحرف لاتيني واحد لأنه قد يكون رتبة/تصنيفاً مثل A أو B.
-        if (normalized.length <= 1) continue;
+        // السماح بالرموز اللاتينية القصيرة للرتب/المستويات مثل A أو S أو LV أو HP.
+        if (isAllowedShortLatinToken(normalized)) continue;
         const key = normalized.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
@@ -327,7 +334,7 @@ async function translateEnglishResiduesOnly(provider, modelToUse, key, translate
     const prompt = `
 أنت مدقق ترجمة عربية. توجد كلمات إنجليزية متبقية داخل فصل عربي.
 المطلوب: ترجم كل كلمة إنجليزية فقط اعتماداً على السياق المجاور، ولا تترجم الجملة كاملة.
-إذا كانت الكلمة حرفاً واحداً يمثل رتبة/تصنيفاً مثل A أو B فلا تُرجعها أصلاً.
+إذا كانت الكلمة رمزاً لاتينياً قصيراً يمثل رتبة/تصنيفاً مثل A أو S أو LV أو HP فلا تُرجعها أصلاً.
 أعد JSON فقط بالشكل:
 [{"word":"EnglishWord","translation":"الترجمة العربية"}]
 
@@ -368,7 +375,7 @@ async function reviewQuestionableChapter(provider, modelToUse, key, translatedTe
 القواعد النهائية:
 1. إذا كان الأصل نفسه قصيراً والعربي يغطي نفس الأحداث وبحجم منطقي، القرار accept حتى لو كان أقل من ${ARABIC_FULL_CHAPTER_WORD_THRESHOLD} كلمة.
 2. إذا كان العربي مختصراً/ناقصاً مقارنة بالأصل أو رسالة ذكاء اصطناعي أو تعليمات، القرار retranslate.
-3. الكلمات اللاتينية المفردة مثل A أو S أو B مسموحة إذا كانت رتباً/تصنيفات ولا تجعل الفصل يفشل.
+3. الرموز اللاتينية القصيرة مثل A أو S أو B أو LV أو HP مسموحة إذا كانت رتباً/تصنيفات/مستويات ولا تجعل الفصل يفشل.
 4. الكلمات الإنجليزية الكاملة داخل النص العربي يجب أن تكون قد تُرجمت واستُبدلت فقط، ولا تطلب إعادة ترجمة فصل كامل بسببها إلا إذا بقيت كثيرة أو أثبتت أن الفصل غير مترجم.
 5. أعد JSON فقط بدون شرح زائد.
 
@@ -384,12 +391,20 @@ async function reviewQuestionableChapter(provider, modelToUse, key, translatedTe
     const response = await callTranslationProvider(provider, modelToUse, key, prompt, options);
     try {
         const parsed = parseJsonFromAiText(response);
+        const rawDecision = String(parsed.decision || parsed.Decision || parsed.status || parsed.result || '').trim().toLowerCase();
+        const decision = ['accept', 'accepted', 'ok', 'pass', 'قبول', 'مقبول'].includes(rawDecision)
+            ? 'accept'
+            : 'retranslate';
         return {
-            decision: parsed.decision === 'accept' ? 'accept' : 'retranslate',
-            reason: parsed.reason || 'قرار المراجع الآلي'
+            decision,
+            reason: parsed.reason || 'قرار المراجع الآلي',
+            rawResponse: response
         };
     } catch (e) {
-        return { decision: 'retranslate', reason: `تعذر تحليل رد المراجعة: ${e.message}` };
+        if (/"decision"\s*:\s*"accept"/i.test(response || '') || /\baccept(?:ed)?\b/i.test(response || '')) {
+            return { decision: 'accept', reason: 'تم قبول الفصل من رد المراجع النصي رغم تعذر تحليل JSON حرفياً', rawResponse: response };
+        }
+        return { decision: 'retranslate', reason: `تعذر تحليل رد المراجعة: ${e.message}`, rawResponse: response };
     }
 }
 
@@ -401,7 +416,7 @@ ${basePrompt}
 - ${reasons.join('\n- ')}
 
 أعد ترجمة الفصل كاملاً من النص الإنجليزي الأصلي أدناه إلى العربية فقط.
-مسموح فقط بحروف لاتينية مفردة للرتب/التصنيفات مثل A أو B عند الحاجة.
+مسموح فقط برموز لاتينية قصيرة للرتب/التصنيفات/المستويات مثل A أو S أو LV أو HP عند الحاجة.
 ممنوع ترك أي كلمة إنجليزية كاملة داخل السرد. ممنوع الاعتذار أو شرح ما فعلته. ممنوع إخراج JSON أو مصطلحات فقط.
 أخرج الفصل المترجم كاملاً فقط.
 
